@@ -184,6 +184,9 @@
   .mini-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border); }
   .mini-row:last-child { border-bottom: none; }
   .mini-key { color: var(--text); font-weight: 600; flex-shrink: 0; min-width: 56px; }
+  a.mini-key { text-decoration: none; }
+  a.mini-key:hover { color: var(--accent-2); text-decoration: underline; }
+  .bar-line-chart a rect:hover { opacity: 0.8; }
   .mini-main { flex: 1; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mini-sub { color: var(--muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }
 </style>
@@ -202,6 +205,10 @@
 
 <script>
 const PALETTE = ["#FA513D", "#0F4861", "#FF8B57", "#83CAEB", "#819299", "#92D050", "#AAAAAA", "#0E2841", "#E8E8E8"];
+const JIRA_BASE_URL = "https://karman-industries.atlassian.net";
+function jiraIssueUrl(issueKey) {
+  return `${JIRA_BASE_URL}/browse/${issueKey}`;
+}
 
 const FUNCTIONS = {
   ops: {
@@ -594,7 +601,7 @@ function timeToReportChartHtml(points) {
     const x = pad.left + i * slot + (slot - barW) / 2;
     const y = yScale(p.value);
     const h = pad.top + plotH - y;
-    return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" rx="4" fill="var(--green)"><title>${p.issueKey}: ${p.value}d to report</title></rect>`;
+    return `<a href="${jiraIssueUrl(p.issueKey)}" target="_blank" rel="noopener"><rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" rx="4" fill="var(--green)"><title>${p.issueKey}: ${p.value}d to report</title></rect></a>`;
   }).join("");
   const trendPoints = points.map((p, i) => `${(pad.left + i * slot + slot / 2).toFixed(1)},${yScale(p.trend).toFixed(1)}`).join(" ");
 
@@ -615,7 +622,7 @@ function recentReportsListHtml(reports) {
   if (!reports.length) return `<div class="mini-row" style="color:var(--muted)">No safety reports</div>`;
   return reports.map((r) => `
     <div class="mini-row">
-      <span class="mini-key">${r.issueKey}</span>
+      <a class="mini-key" href="${jiraIssueUrl(r.issueKey)}" target="_blank" rel="noopener">${r.issueKey}</a>
       <span class="mini-main">${r.reportType}</span>
       <span class="mini-sub">${r.statusCategory}</span>
     </div>
@@ -626,7 +633,7 @@ function oldestOpenActionsListHtml(actions) {
   if (!actions.length) return `<div class="mini-row" style="color:var(--muted)">No open further actions 🎉</div>`;
   return actions.map((a) => `
     <div class="mini-row">
-      <span class="mini-key">${a.issueKey}</span>
+      <a class="mini-key" href="${jiraIssueUrl(a.issueKey)}" target="_blank" rel="noopener">${a.issueKey}</a>
       <span class="mini-main">${a.assignee || "Unassigned"}</span>
       <span class="mini-sub" style="color:${AGING_BUCKET_COLOR_VAR[agingBucketFor(a.ageDays)]}">${a.ageDays}d</span>
     </div>
