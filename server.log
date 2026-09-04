@@ -1,0 +1,1 @@
+/usr/bin/bash: line 1: node: command not found

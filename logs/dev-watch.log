@@ -1,0 +1,6 @@
+Business metrics dashboard listening on :4100 (DATA_SOURCE=live)
+(node:48764) [DEP0123] DeprecationWarning: Setting the TLS ServerName to an IP address is not permitted by RFC 6066. This will be ignored in a future version.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+Change detected in 'C:\\Users\\SahanyaPogaku\\Downloads\\1\\src\\services\\safetyMetrics.js'
+Restarting 'server.js'
+Business metrics dashboard listening on :4100 (DATA_SOURCE=live)
