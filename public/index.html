@@ -97,6 +97,8 @@
   }
   .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
   .card .value { font-size: 30px; font-weight: 700; margin-top: 6px; }
+  .card.clickable { cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+  .card.clickable:hover { border-color: var(--accent); background: var(--panel-2); }
   .card .value.red { color: var(--red); }
   .card .value.green { color: var(--green); }
 
@@ -156,9 +158,17 @@
 
   .widget-grid {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    /* The center column contains the two charts with axis values, so it gets
+       a modest width increase without pushing any cards onto another row. */
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.18fr) minmax(0, 1fr);
     gap: 16px;
   }
+  /* Grid stretch already equalizes card height, but sparse content (e.g. the
+     TRIR gauge) left a big empty gap at the bottom compared to a fuller card
+     (e.g. the aging donut). Centering each card's body vertically within the
+     shared height fixes the visual imbalance without changing card heights. */
+  .widget-grid .chart-card { display: flex; flex-direction: column; }
+  .widget-grid .chart-card .widget-body { flex: 1; display: flex; flex-direction: column; justify-content: center; }
   @media (max-width: 900px) {
     .widget-grid { grid-template-columns: repeat(2, 1fr); }
   }
@@ -186,9 +196,42 @@
   .mini-key { color: var(--text); font-weight: 600; flex-shrink: 0; min-width: 56px; }
   a.mini-key { text-decoration: none; }
   a.mini-key:hover { color: var(--accent-2); text-decoration: underline; }
+  /* Accessible blue, distinct from the muddy default browser blue/purple on a
+     dark background — kept as one fixed color for every Jira link in this
+     table (not just on hover), same understated no-underline-until-hover
+     interaction as .mini-key elsewhere in the dashboard. */
+  a.jira-link { color: #6298f0; text-decoration: none; }
+  a.jira-link:hover { text-decoration: underline; }
+  a.jira-link:visited { color: #8596b3; }
   .bar-line-chart a rect:hover { opacity: 0.8; }
   .mini-main { flex: 1; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mini-sub { color: var(--muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+
+  .text-input {
+    padding: 10px 12px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 14px;
+  }
+  .btn-primary {
+    padding: 10px 18px;
+    background: var(--accent);
+    border: none;
+    border-radius: 8px;
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .btn-primary:hover { background: var(--accent-2); }
+  .col-divider { border-right: 2px solid var(--border); }
+
+  .filter-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+  .filter-bar .text-input { max-width: 180px; }
+  .checkbox-label { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; }
+  .checkbox-label input { cursor: pointer; }
 </style>
 </head>
 <body>
@@ -235,6 +278,7 @@ const FUNCTIONS = {
     label: "Engineering",
     subtabs: {
       "release-status": { label: "Part Release Status", load: loadReleaseStatus },
+      "part-demand-status": { label: "Part Demand Status", load: loadPartDemandStatus },
     },
   },
 };
@@ -278,6 +322,45 @@ function fmtDate(d) {
   if (!d) return "—";
   return new Date(d).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
+// Display-only capitalization fix for usp_refresh_match_results' status_bucket
+// values — meaning/values unchanged, just normalized casing. Explicit map (not
+// a generic title-case algorithm) so "PO" stays an acronym rather than "Po".
+// Falls back to the raw string for any value not in this list.
+const APPROVAL_STATUS_LABELS = {
+  "No PO in Brex memo": "No PO In Brex Memo",
+  "No Jira approval found": "No Jira Approval Found",
+  "Awaiting Invoice": "Awaiting Invoice",
+  "Not yet received": "Not Yet Received",
+  "Fully validated": "Approved",
+  "Within 10% of approved amount": "Within 10% Of Approved Amount",
+  "Over Authorized Amount": "Over Authorized Amount",
+};
+function formatApprovalStatus(raw) {
+  return APPROVAL_STATUS_LABELS[raw] ?? raw;
+}
+
+// Explicit overrides for these categories; everything else falls back to the
+// default cycling PALETTE (see buildApprovalColorMap). Blue shades picked
+// bright enough to stay readable on the dark background.
+const APPROVAL_STATUS_ACCENT = {
+  "No PO in Brex memo": "#3B82F6",
+  "No Jira approval found": "#7DD3FC",
+  "Over Authorized Amount": "var(--red)",
+  "Not yet received": "var(--amber)",
+};
+
+// One color per category, shared by the pie chart and the $ Approval table
+// text so they always match. Built once from the full bucket list (not just
+// whichever subset is currently displayed) so a category's color never
+// shifts depending on which view (mismatches vs. matched) is showing it.
+function buildApprovalColorMap(buckets) {
+  const map = {};
+  buckets.forEach((b, i) => {
+    map[b.label] = APPROVAL_STATUS_ACCENT[b.label] || PALETTE[i % PALETTE.length];
+  });
+  return map;
+}
+
 function fmtMoney(n) {
   if (n == null) return "—";
   return "$" + Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -291,20 +374,22 @@ function fmtNum(n) {
 }
 
 // Renders a CSS conic-gradient pie chart + legend into `container` from
-// `slices`: [{ label, value }]. Returns nothing; mutates container.innerHTML.
+// `slices`: [{ label, value, color? }]. `color` optionally overrides one
+// slice's color; slices without it fall back to the default cycling PALETTE.
 function pieChartHtml(slices, opts = {}) {
   const total = slices.reduce((s, x) => s + x.value, 0) || 1;
+  const colorFor = (s, i) => s.color || PALETTE[i % PALETTE.length];
   let acc = 0;
   const stops = slices.map((s, i) => {
     const start = (acc / total) * 360;
     acc += s.value;
     const end = (acc / total) * 360;
-    return `${PALETTE[i % PALETTE.length]} ${start}deg ${end}deg`;
+    return `${colorFor(s, i)} ${start}deg ${end}deg`;
   }).join(", ");
 
   const legendRows = slices.map((s, i) => `
     <div class="legend-row">
-      <span class="swatch" style="background:${PALETTE[i % PALETTE.length]}"></span>
+      <span class="swatch" style="background:${colorFor(s, i)}"></span>
       <span class="legend-label">${s.label}</span>
       <span class="legend-value">${s.value}${opts.pct ? " (" + Math.round((s.value / total) * 100) + "%)" : ""}</span>
     </div>
@@ -405,22 +490,41 @@ async function loadJiraIssues(main) {
   `;
 }
 
-async function loadThreeWayMatch(main) {
-  const data = await fetchJson("/api/metrics/finance/three-way-match");
-  const slices = data.buckets.map((b) => ({ label: b.label, value: b.count }));
+function receiptStatusLabel(isFullyReceived) {
+  // ISNULL(is_fully_received, 0) = 0 is exactly how usp_refresh_match_results
+  // itself treats "not yet received" — null and false both read as "No" here.
+  return isFullyReceived ? "Received" : "Pending";
+}
 
-  const rowsHtml = data.mismatches.length
-    ? data.mismatches.map((m) => `
+function threeWayMatchRowsHtml(rows, colorMap) {
+  return rows.length
+    ? rows.slice(0, 100).map((m) => {
+        const jiraRefCell = m.issue_key
+          ? `<a class="jira-link" href="${jiraIssueUrl(m.issue_key)}" target="_blank" rel="noopener">${m.issue_key}</a>`
+          : `<span style="color:var(--muted)">—</span>`;
+        return `
         <tr>
           <td>${m.invoice_number || "—"}</td>
           <td>${m.supplier || "—"}</td>
           <td>${m.po_number || "—"}</td>
+          <td>${jiraRefCell}</td>
           <td>${fmtMoney(m.bill_amount)}</td>
           <td>${fmtMoney(m.jira_authorized_amount)}</td>
-          <td class="badge-red">${m.status_bucket}</td>
+          <td>${m.invoice_status || "—"}</td>
+          <td>${m.payment_status || "—"}</td>
+          <td>${m.jira_status || "—"}</td>
+          <td>${receiptStatusLabel(m.is_fully_received)}</td>
+          <td style="color:${colorMap[m.status_bucket] || "var(--text)"};font-weight:600">${formatApprovalStatus(m.status_bucket)}</td>
         </tr>
-      `).join("")
-    : `<tr><td colspan="6" style="color:var(--muted)">No mismatches 🎉</td></tr>`;
+      `;
+      }).join("")
+    : `<tr><td colspan="11" style="color:var(--muted)">No matching rows</td></tr>`;
+}
+
+async function loadThreeWayMatch(main) {
+  const data = await fetchJson("/api/metrics/finance/three-way-match");
+  const approvalColorMap = buildApprovalColorMap(data.buckets);
+  const slices = data.buckets.map((b) => ({ label: formatApprovalStatus(b.label), value: b.count, color: approvalColorMap[b.label] }));
 
   main.innerHTML = `
     <div class="stat-grid">
@@ -428,7 +532,7 @@ async function loadThreeWayMatch(main) {
         <div class="label">Total Records</div>
         <div class="value">${data.total}</div>
       </div>
-      <div class="card">
+      <div class="card clickable" id="twm-matched-card">
         <div class="label">Fully Matched</div>
         <div class="value green">${data.matched}</div>
       </div>
@@ -439,18 +543,108 @@ async function loadThreeWayMatch(main) {
     </div>
     <div class="chart-row">
       <div class="chart-card">
-        <h2>By Status Bucket</h2>
+        <h2>By $ Approval</h2>
         ${pieChartHtml(slices, { pct: true })}
       </div>
       <div class="chart-card">
-        <h2>Mismatches (most recent 100)</h2>
+        <h2 id="twm-title">Mismatches</h2>
+        <div id="twm-filter-bar" class="filter-bar">
+          <input id="twm-filter-invoice" type="text" class="text-input" placeholder="Invoice #" />
+          <input id="twm-filter-supplier" type="text" class="text-input" placeholder="Supplier" />
+          <input id="twm-filter-po" type="text" class="text-input" placeholder="PO #" />
+          <select id="twm-filter-status" class="text-input"></select>
+          <label class="checkbox-label">
+            <input id="twm-show-no-po" type="checkbox" />
+            Show rows with no PO number
+          </label>
+        </div>
+        <div id="twm-back" style="display:none;margin-bottom:8px">
+          <a href="#" id="twm-back-link">&larr; Back to mismatches</a>
+        </div>
+        <div id="twm-count" style="font-size:12px;color:var(--muted);margin-bottom:8px"></div>
         <table>
-          <thead><tr><th>Invoice #</th><th>Supplier</th><th>PO #</th><th>Bill Amount</th><th>Jira Authorized</th><th>Status</th></tr></thead>
-          <tbody>${rowsHtml}</tbody>
+          <thead><tr>
+            <th>Invoice #</th><th>Supplier</th><th>PO #</th><th>Jira Reference</th>
+            <th>Bill Amount</th><th>Jira Authorized Amount</th>
+            <th>Brex Invoice Status</th><th>Brex Payment Status</th><th>Jira Approval Status</th><th>Receipt Status</th>
+            <th>$ Approval</th>
+          </tr></thead>
+          <tbody id="twm-tbody"></tbody>
         </table>
       </div>
     </div>
   `;
+
+  const invoiceInput = document.getElementById("twm-filter-invoice");
+  const supplierInput = document.getElementById("twm-filter-supplier");
+  const poInput = document.getElementById("twm-filter-po");
+  const statusSelect = document.getElementById("twm-filter-status");
+  const showNoPoCheckbox = document.getElementById("twm-show-no-po");
+
+  const statusOptions = [...new Set(data.mismatches.map((m) => m.status_bucket).filter(Boolean))].sort();
+  statusSelect.innerHTML = `<option value="">All Statuses</option>` +
+    statusOptions.map((s) => `<option value="${s}">${formatApprovalStatus(s)}</option>`).join("");
+  const tbody = document.getElementById("twm-tbody");
+  const countLabel = document.getElementById("twm-count");
+  const titleEl = document.getElementById("twm-title");
+  const filterBar = document.getElementById("twm-filter-bar");
+  const backRow = document.getElementById("twm-back");
+  let mode = "mismatches";
+
+  function renderRows() {
+    if (mode === "matched") {
+      const rows = data.matchedRecords || [];
+      countLabel.textContent = `Showing ${Math.min(rows.length, 100)} of ${rows.length} fully matched record${rows.length === 1 ? "" : "s"}`;
+      tbody.innerHTML = threeWayMatchRowsHtml(rows, approvalColorMap);
+      return;
+    }
+
+    const invoiceTerm = invoiceInput.value.trim().toLowerCase();
+    const supplierTerm = supplierInput.value.trim().toLowerCase();
+    const poTerm = poInput.value.trim().toLowerCase();
+    const statusTerm = statusSelect.value;
+    const showNoPo = showNoPoCheckbox.checked;
+
+    const filtered = data.mismatches.filter((m) => {
+      const hasPo = m.po_number != null && m.po_number !== "";
+      if (!showNoPo && !hasPo) return false;
+      if (invoiceTerm && !(m.invoice_number || "").toLowerCase().includes(invoiceTerm)) return false;
+      if (supplierTerm && !(m.supplier || "").toLowerCase().includes(supplierTerm)) return false;
+      if (poTerm && !(m.po_number || "").toLowerCase().includes(poTerm)) return false;
+      if (statusTerm && m.status_bucket !== statusTerm) return false;
+      return true;
+    });
+
+    countLabel.textContent = `Showing ${Math.min(filtered.length, 100)} of ${filtered.length} matching row${filtered.length === 1 ? "" : "s"}`;
+    tbody.innerHTML = threeWayMatchRowsHtml(filtered, approvalColorMap);
+  }
+
+  function showMatched() {
+    mode = "matched";
+    titleEl.textContent = "Fully Matched Records";
+    filterBar.style.display = "none";
+    backRow.style.display = "block";
+    renderRows();
+  }
+
+  function showMismatches() {
+    mode = "mismatches";
+    titleEl.textContent = "Mismatches";
+    filterBar.style.display = "flex";
+    backRow.style.display = "none";
+    renderRows();
+  }
+
+  document.getElementById("twm-matched-card").addEventListener("click", showMatched);
+  document.getElementById("twm-back-link").addEventListener("click", (e) => {
+    e.preventDefault();
+    showMismatches();
+  });
+
+  [invoiceInput, supplierInput, poInput].forEach((el) => el.addEventListener("input", renderRows));
+  statusSelect.addEventListener("change", renderRows);
+  showNoPoCheckbox.addEventListener("change", renderRows);
+  renderRows();
 }
 
 async function loadReleaseStatus(main) {
@@ -493,6 +687,185 @@ async function loadReleaseStatus(main) {
       </div>
     </div>
   `;
+}
+
+function makeBuyLabel(header) {
+  const labels = [];
+  if (header.isMake) labels.push("Make");
+  if (header.isBuy) labels.push("Buy");
+  return labels.length ? labels.join(" / ") : "—";
+}
+
+function partHeaderHtml(header) {
+  return `
+    <div class="stat-grid">
+      <div class="card">
+        <div class="label">Part Number</div>
+        <div class="value" style="font-size:22px">${header.partNumber}</div>
+      </div>
+      <div class="card">
+        <div class="label">Description</div>
+        <div class="value" style="font-size:16px">${header.description || "—"}</div>
+      </div>
+      <div class="card">
+        <div class="label">Make / Buy</div>
+        <div class="value" style="font-size:16px">${makeBuyLabel(header)}</div>
+      </div>
+      <div class="card">
+        <div class="label">Lead Time</div>
+        <div class="value" style="font-size:16px">${header.leadTimeDays != null ? header.leadTimeDays + "d" : "—"}</div>
+      </div>
+    </div>
+  `;
+}
+
+// LEFT = demand, RIGHT = supply, one row per 1:1 allocated (or unmatched) pairing.
+// Supply rows with no completion date are on-hand inventory — already available.
+
+function allocationTableHtml(rows) {
+  if (!rows.length) return `<div class="placeholder">No open demand for this part</div>`;
+
+  const body = rows.map((r) => {
+    const d = r.demand;
+    const s = r.supply;
+    const completionLabel = s && s.estimatedCompletionDate
+      ? fmtDate(s.estimatedCompletionDate)
+      : s && s.fulfilledBy === "Inventory"
+        ? "In stock"
+        : "Not yet scheduled";
+    const supplyCells = s
+      ? `
+        <td>${completionLabel}</td>
+        <td>${s.rev || "—"}</td>
+        <td>${s.fulfilledBy}${s.supplier ? " (" + s.supplier + ")" : ""}</td>
+        <td>${s.reference || "—"}</td>
+        <td>${s.location || "—"}</td>
+        <td>${s.pedigree || "—"}</td>
+        <td>${s.quantity}</td>
+      `
+      : `<td colspan="7" class="badge-red">Unmatched — insufficient supply</td>`;
+    const demandRev = d.rev || "—";
+    return `
+      <tr>
+        <td>${fmtDate(d.needDate)}</td>
+        <td>${demandRev}</td>
+        <td class="col-divider">${d.quantity}</td>
+        ${supplyCells}
+      </tr>
+    `;
+  }).join("");
+
+  return `
+    <div style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th colspan="3" style="text-align:center">Demand</th>
+            <th colspan="7" style="text-align:center">Supply</th>
+          </tr>
+          <tr>
+            <th>Need Date</th><th>Rev</th><th class="col-divider">Qty Demanded</th>
+            <th>Est. Completion</th><th>Rev</th><th>Fulfilled By</th><th>Reference</th><th>Location</th><th>Pedigree</th><th>Qty</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function orphansHtml(rows) {
+  if (!rows.length) return "";
+  const body = rows.map((r) => `
+    <tr>
+      <td>${r.type}</td>
+      <td>${r.poReference || r.reference || "—"}</td>
+      <td>${r.location || "—"}</td>
+      <td>${r.quantity}${r.occurrences > 1 ? ` <span style="color:var(--muted)">(${r.occurrences}x)</span>` : ""}</td>
+      <td>${r.pedigree || "—"}</td>
+    </tr>
+  `).join("");
+  return `
+    <h2 style="margin-top:24px">Orphans (not allocated)</h2>
+    <table>
+      <thead><tr><th>Type</th><th>PO / Reference</th><th>Location</th><th>Qty</th><th>Pedigree</th></tr></thead>
+      <tbody>${body}</tbody>
+    </table>
+  `;
+}
+
+function inventoryLotsHtml(title, rows, { showStatus = false, showNonConformance = false } = {}) {
+  if (!rows.length) return "";
+  const body = rows.map((r) => `
+    <tr>
+      <td>${r.reference || "—"}</td>
+      <td>${r.location || "—"}</td>
+      <td>${r.rev || "—"}</td>
+      <td>${r.pedigree || "—"}</td>
+      ${showStatus ? `<td>${r.status || "—"}</td>` : ""}
+      ${showNonConformance ? `<td>${r.nonConformance || "—"}</td>` : ""}
+      <td>${r.quantity}</td>
+    </tr>
+  `).join("");
+  return `
+    <h2 style="margin-top:24px">${title}</h2>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr>
+          <th>Lot / Serial / Tag</th><th>Location</th><th>Rev</th><th>Pedigree</th>
+          ${showStatus ? "<th>Status</th>" : ""}
+          ${showNonConformance ? "<th>Non-Conformance</th>" : ""}
+          <th>Qty</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function loadPartDemandStatus(main) {
+  main.innerHTML = `
+    <div class="chart-card" style="margin-bottom:24px">
+      <h2>Look Up a Part</h2>
+      <div style="display:flex;gap:10px;align-items:center">
+        <input id="part-demand-input" type="text" class="text-input" style="flex:1;max-width:320px"
+          placeholder="Part number, e.g. 1000005-000" />
+        <button id="part-demand-lookup-btn" class="btn-primary">Look Up</button>
+      </div>
+    </div>
+    <div id="part-demand-results"></div>
+  `;
+
+  const input = document.getElementById("part-demand-input");
+  const results = document.getElementById("part-demand-results");
+
+  async function runLookup() {
+    const partNumber = input.value.trim();
+    if (!partNumber) return;
+    results.innerHTML = `<div class="loading">Looking up ${partNumber}…</div>`;
+    try {
+      const data = await fetchJson(`/api/metrics/engineering/part-demand-status?partNumber=${encodeURIComponent(partNumber)}`);
+      if (!data.header) {
+        results.innerHTML = `<div class="placeholder">No active part found for "${partNumber}"</div>`;
+        return;
+      }
+      results.innerHTML = `
+        ${partHeaderHtml(data.header)}
+        <h2 style="margin-top:24px">Demand / Supply Allocation</h2>
+        ${allocationTableHtml(data.allocation)}
+        ${inventoryLotsHtml("Available Supply (not currently needed)", data.availableSupply || [])}
+        ${inventoryLotsHtml("Blocked / On-Hold Inventory", data.blockedInventory || [], { showStatus: true, showNonConformance: true })}
+        ${orphansHtml(data.orphans)}
+      `;
+    } catch (err) {
+      results.innerHTML = `<div class="error">Failed to load part demand status: ${err.message}</div>`;
+    }
+  }
+
+  document.getElementById("part-demand-lookup-btn").onclick = runLookup;
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") runLookup();
+  });
 }
 
 const AGING_BUCKET_COLOR_VAR = {
@@ -555,7 +928,7 @@ function donutChartHtml(slices) {
 // (one series — the card title already names it); the target is direct-labeled inline.
 function lineChartWithTargetHtml(points, target) {
   const width = 480, height = 160;
-  const pad = { top: 16, right: 8, bottom: 8, left: 8 };
+  const pad = { top: 16, right: 8, bottom: 8, left: 28 };
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
   const finiteValues = points.map((p) => p.y).filter((v) => v != null);
@@ -566,17 +939,48 @@ function lineChartWithTargetHtml(points, target) {
 
   if (!points.length) return `<div class="loading" style="padding:40px 0">No data yet</div>`;
 
-  const linePoints = points.map((p, i) => `${xScale(i)},${yScale(p.y ?? 0)}`).join(" ");
+  // Y-axis: 4 evenly spaced ticks from 0 to the chart's own max, rounded to
+  // clean numbers per the dashboard's axis-label convention elsewhere.
+  const tickCount = 4;
+  const ticks = Array.from({ length: tickCount + 1 }, (_, i) => Math.round((maxVal / tickCount) * i));
+  const axisHtml = ticks.map((t) => {
+    const y = yScale(t);
+    return `
+      <line x1="${pad.left}" y1="${y}" x2="${width - pad.right}" y2="${y}" stroke="var(--border)" stroke-width="1" />
+      <text x="${pad.left - 6}" y="${y}" text-anchor="end" dominant-baseline="middle" font-size="10" fill="var(--muted)">${t}</text>
+    `;
+  }).join("");
+
+  // Break the line at any month with no data instead of connecting straight
+  // across the gap (which would visually imply a trend that isn't there).
+  // Segments are grouped by index-adjacency, not just by filtering out nulls,
+  // so two data points on either side of a gap never get joined.
+  const segments = [];
+  let current = [];
+  points.forEach((p, i) => {
+    if (p.y == null) {
+      if (current.length) segments.push(current);
+      current = [];
+    } else {
+      current.push(`${xScale(i)},${yScale(p.y)}`);
+    }
+  });
+  if (current.length) segments.push(current);
+  const polylines = segments
+    .map((seg) => `<polyline points="${seg.join(" ")}" fill="none" stroke="var(--accent-2)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />`)
+    .join("");
+
   const dots = points
-    .map((p, i) => `<circle cx="${xScale(i)}" cy="${yScale(p.y ?? 0)}" r="4" fill="var(--accent-2)" stroke="var(--panel)" stroke-width="2"><title>${p.x}: ${p.y == null ? "—" : p.y.toFixed(1) + ":1"}</title></circle>`)
+    .map((p, i) => p.y == null ? "" : `<circle cx="${xScale(i)}" cy="${yScale(p.y)}" r="4" fill="var(--accent-2)" stroke="var(--panel)" stroke-width="2"><title>${p.x}: ${p.y.toFixed(1)}:1</title></circle>`)
     .join("");
   const targetY = yScale(target);
 
   return `
     <svg class="line-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+      ${axisHtml}
       <line x1="${pad.left}" y1="${targetY}" x2="${width - pad.right}" y2="${targetY}" stroke="var(--muted)" stroke-width="1" stroke-dasharray="4 4" />
       <text x="${width - pad.right}" y="${targetY - 6}" text-anchor="end" font-size="10" fill="var(--muted)">target ${target}:1</text>
-      <polyline points="${linePoints}" fill="none" stroke="var(--accent-2)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />
+      ${polylines}
       ${dots}
     </svg>
     <div class="axis-footer"><span>${points[0].x}</span><span>${points[points.length - 1].x}</span></div>
@@ -584,36 +988,56 @@ function lineChartWithTargetHtml(points, target) {
 }
 
 // Bars (days to report) + a rolling-average trend line, sharing one axis (days).
+// No confirmed company policy for reporting turnaround — 7 days is a
+// placeholder for the right-axis "% of target" scale until a real value is
+// set. Left (days) and right (% of target) are the same linear scale just
+// relabeled in two units (like °C/°F), not two independent y-scales, so a
+// single yScale() drives both bars and the trend line correctly.
+const REPORT_TARGET_DAYS = 7;
+
 function timeToReportChartHtml(points) {
   const width = 480, height = 160;
-  const pad = { top: 12, right: 8, bottom: 8, left: 8 };
+  const pad = { top: 12, right: 34, bottom: 8, left: 28 };
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
-  const maxVal = Math.max(...points.map((p) => p.value), 1) * 1.15;
+  const maxVal = Math.max(...points.map((p) => p.value), REPORT_TARGET_DAYS, 1) * 1.15;
   const n = points.length;
   const slot = n ? plotW / n : plotW;
-  const barW = Math.min(24, slot * 0.6);
+  const barW = slot; // 100% bars — full width, no gaps between them
   const yScale = (v) => pad.top + plotH - (v / maxVal) * plotH;
 
   if (!n) return `<div class="loading" style="padding:40px 0">No data yet</div>`;
 
+  const tickCount = 4;
+  const ticks = Array.from({ length: tickCount + 1 }, (_, i) => Math.round((maxVal / tickCount) * i));
+  const axisHtml = ticks.map((t) => {
+    const y = yScale(t);
+    const pct = Math.round((t / REPORT_TARGET_DAYS) * 100);
+    return `
+      <line x1="${pad.left}" y1="${y}" x2="${width - pad.right}" y2="${y}" stroke="var(--border)" stroke-width="1" />
+      <text x="${pad.left - 6}" y="${y}" text-anchor="end" dominant-baseline="middle" font-size="10" fill="var(--muted)">${t}</text>
+      <text x="${width - pad.right + 6}" y="${y}" text-anchor="start" dominant-baseline="middle" font-size="10" fill="var(--accent-2)">${pct}%</text>
+    `;
+  }).join("");
+
   const bars = points.map((p, i) => {
-    const x = pad.left + i * slot + (slot - barW) / 2;
+    const x = pad.left + i * slot;
     const y = yScale(p.value);
     const h = pad.top + plotH - y;
-    return `<a href="${jiraIssueUrl(p.issueKey)}" target="_blank" rel="noopener"><rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" rx="4" fill="var(--green)"><title>${p.issueKey}: ${p.value}d to report</title></rect></a>`;
+    return `<a href="${jiraIssueUrl(p.issueKey)}" target="_blank" rel="noopener"><rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="var(--green)"><title>${p.issueKey}: ${p.value}d to report</title></rect></a>`;
   }).join("");
   const trendPoints = points.map((p, i) => `${(pad.left + i * slot + slot / 2).toFixed(1)},${yScale(p.trend).toFixed(1)}`).join(" ");
 
   return `
     <svg class="bar-line-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+      ${axisHtml}
       ${bars}
       <polyline points="${trendPoints}" fill="none" stroke="var(--accent-2)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />
     </svg>
     <div class="axis-footer"><span>${fmtDate(points[0].occurrenceDate)}</span><span>${fmtDate(points[points.length - 1].occurrenceDate)}</span></div>
     <div class="mini-legend">
       <span class="item"><span class="swatch" style="background:var(--green)"></span>Days to report</span>
-      <span class="item"><span class="swatch" style="background:var(--accent-2)"></span>3-report average</span>
+      <span class="item"><span class="swatch" style="background:var(--accent-2)"></span>3-report average (right axis: % of ${REPORT_TARGET_DAYS}d target, placeholder)</span>
     </div>
   `;
 }
@@ -623,7 +1047,7 @@ function recentReportsListHtml(reports) {
   return reports.map((r) => `
     <div class="mini-row">
       <a class="mini-key" href="${jiraIssueUrl(r.issueKey)}" target="_blank" rel="noopener">${r.issueKey}</a>
-      <span class="mini-main">${r.reportType}</span>
+      <span class="mini-main" title="${r.title || ""}">${r.title || r.reportType}</span>
       <span class="mini-sub">${r.statusCategory}</span>
     </div>
   `).join("");
@@ -640,6 +1064,26 @@ function oldestOpenActionsListHtml(actions) {
   `).join("");
 }
 
+// Fills in every calendar month between the first and last data point with a
+// null-ratio placeholder, so the chart can render a real point per month and
+// break the line across any month with no reports, instead of the raw sparse
+// array connecting distant months straight across a gap.
+function fillMonthlyGaps(trend) {
+  if (!trend.length) return [];
+  const toKey = (d) => d.getUTCFullYear() * 12 + d.getUTCMonth();
+  const byKey = new Map(trend.map((t) => [toKey(new Date(t.period)), t]));
+  const keys = trend.map((t) => toKey(new Date(t.period)));
+  const minKey = Math.min(...keys);
+  const maxKey = Math.max(...keys);
+  const filled = [];
+  for (let k = minKey; k <= maxKey; k++) {
+    const existing = byKey.get(k);
+    const period = new Date(Date.UTC(Math.floor(k / 12), k % 12, 1));
+    filled.push({ period, ratio: existing ? existing.ratio : null });
+  }
+  return filled;
+}
+
 function rollingAverage(values, windowSize) {
   return values.map((_, i) => {
     const start = Math.max(0, i - windowSize + 1);
@@ -651,7 +1095,7 @@ function rollingAverage(values, windowSize) {
 async function loadSafetyOverview(main) {
   const data = await fetchJson("/api/metrics/safety/overview");
 
-  const leadingLaggingPoints = data.leadingLaggingRatio.trend.map((t) => ({ x: fmtMonth(t.period), y: t.ratio }));
+  const leadingLaggingPoints = fillMonthlyGaps(data.leadingLaggingRatio.trend).map((t) => ({ x: fmtMonth(t.period), y: t.ratio }));
 
   const agingSlices = data.furtherActionAging.map((b) => ({ label: b.bucket, value: b.count, color: AGING_BUCKET_COLOR_VAR[b.bucket] }));
 
@@ -662,31 +1106,33 @@ async function loadSafetyOverview(main) {
     <div class="widget-grid">
       <div class="chart-card">
         <h2>TRIR</h2>
-        ${gaugeBlockedHtml(data.trir.reason)}
-        <div class="stat-sub">
-          <div class="label">OSHA Recordable Incidents (all-time)</div>
-          <div class="value">${fmtNum(data.trir.oshaRecordableCount)}</div>
+        <div class="widget-body">
+          ${gaugeBlockedHtml(data.trir.reason)}
+          <div class="stat-sub">
+            <div class="label">OSHA Recordable Incidents (all-time)</div>
+            <div class="value">${fmtNum(data.trir.oshaRecordableCount)}</div>
+          </div>
         </div>
       </div>
       <div class="chart-card">
         <h2>Leading : Lagging Ratio</h2>
-        ${lineChartWithTargetHtml(leadingLaggingPoints, data.leadingLaggingRatio.targetRatio)}
+        <div class="widget-body">${lineChartWithTargetHtml(leadingLaggingPoints, data.leadingLaggingRatio.targetRatio)}</div>
       </div>
       <div class="chart-card">
         <h2>Further Action Aging</h2>
-        ${donutChartHtml(agingSlices)}
+        <div class="widget-body">${donutChartHtml(agingSlices)}</div>
       </div>
       <div class="chart-card">
         <h2>Recent Safety Reports</h2>
-        <div class="mini-list">${recentReportsListHtml(data.recentReports)}</div>
+        <div class="widget-body"><div class="mini-list">${recentReportsListHtml(data.recentReports)}</div></div>
       </div>
       <div class="chart-card">
         <h2>Time to Report</h2>
-        ${timeToReportChartHtml(timeToReportPoints)}
+        <div class="widget-body">${timeToReportChartHtml(timeToReportPoints)}</div>
       </div>
       <div class="chart-card">
         <h2>Oldest Open Further Actions</h2>
-        <div class="mini-list">${oldestOpenActionsListHtml(data.oldestOpenActions)}</div>
+        <div class="widget-body"><div class="mini-list">${oldestOpenActionsListHtml(data.oldestOpenActions)}</div></div>
       </div>
     </div>
   `;

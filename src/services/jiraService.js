@@ -33,7 +33,6 @@ export async function getOpenIssuesByProject() {
       results.push({ projectKey: p.key, projectName: p.name, openCount });
     }
   }
-
   results.sort((a, b) => b.openCount - a.openCount);
   return {
     total: results.reduce((sum, r) => sum + r.openCount, 0),

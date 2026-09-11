@@ -59,6 +59,25 @@ app.get("/api/metrics/finance/three-way-match", wrap(liveThreeWayMatch, "finance
 app.get("/api/metrics/engineering/release-status", wrap(liveReleaseStatus, "engineering-release-status.json"));
 app.get("/api/metrics/safety/overview", wrap(liveSafetyOverview, "safety-overview.json"));
 
+// Parameterized by part number, so it can't be precomputed into a snapshot blob
+// like the metrics above — always queries MFGO_DB live. MFGO_DB is an Azure SQL
+// public endpoint (unlike on-prem Teamcenter or the Jira-allowlisted IP), so this
+// is reachable the same way whether the app is running on-prem or in Azure.
+app.get("/api/metrics/engineering/part-demand-status", async (req, res) => {
+  const partNumber = (req.query.partNumber || "").trim();
+  if (!partNumber) {
+    return res.status(400).json({ error: "partNumber query parameter is required" });
+  }
+  try {
+    const { getPartDemandStatus } = await import("./src/services/partDemandStatus.js");
+    const data = await getPartDemandStatus(partNumber);
+    res.json(data);
+  } catch (err) {
+    console.error(`[${req.path}]`, err.message);
+    res.status(500).json({ error: "Failed to load part demand status", detail: err.message });
+  }
+});
+
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });

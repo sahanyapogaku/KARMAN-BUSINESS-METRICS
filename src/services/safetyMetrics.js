@@ -19,9 +19,22 @@ const AGING_BUCKET_ORDER = ["<7d", "8-30d", "31-60d", ">60d"];
 // source to pair with it either (Entra/Gusto integration is a known upcoming blocker
 // for other provisioning work too). Wire up both a real hours_worked pipeline and a
 // headcount source before computing this instead of returning trir.available: false.
+//
+// CANCELLED-TICKET HANDLING: Jira's status-category system has no "Cancelled"
+// category of its own — a report with raw status = 'Cancelled' still reports
+// status_category = 'Done', indistinguishable from a genuinely completed
+// report to anything that only reads status_category. Every query below
+// against dbo.safety_reports therefore filters on the raw status column
+// (status <> 'Cancelled') rather than relying on status_category, so a
+// cancelled report never counts as a real recordable incident, never shows
+// up in Recent Safety Reports looking like a completed one, and never
+// contributes to the leading:lagging or time-to-report trends. (The
+// further_actions queries below don't need this: status_category <> 'Done'
+// already excludes Cancelled there, since Cancelled maps to the Done
+// category — there's no separate raw-status column being bypassed.)
 async function getTrir(pool) {
   const result = await pool.request().query(`
-    SELECT COUNT(*) AS cnt FROM dbo.safety_reports WHERE osha_recordable = 'Yes'
+    SELECT COUNT(*) AS cnt FROM dbo.safety_reports WHERE osha_recordable = 'Yes' AND status <> 'Cancelled'
   `);
   return {
     available: false,
@@ -37,7 +50,7 @@ async function getLeadingLaggingTrend(pool) {
       SUM(CASE WHEN leading_or_lagging = 'Leading' THEN 1 ELSE 0 END) AS leadingCount,
       SUM(CASE WHEN leading_or_lagging = 'Lagging' THEN 1 ELSE 0 END) AS laggingCount
     FROM dbo.safety_reports
-    WHERE occurrence_date IS NOT NULL
+    WHERE occurrence_date IS NOT NULL AND status <> 'Cancelled'
     GROUP BY DATEFROMPARTS(YEAR(occurrence_date), MONTH(occurrence_date), 1)
     ORDER BY period ASC
   `);
@@ -53,13 +66,21 @@ async function getLeadingLaggingTrend(pool) {
 }
 
 async function getRecentReports(pool) {
+  // created_date is a date (no time component), so multiple reports filed on
+  // the same calendar day have no deterministic order from created_date alone
+  // — ORDER BY created_date DESC only was returning arbitrary DB row order
+  // among same-day ties (the exact non-determinism bug already found once in
+  // Finance's matched_at). issue_key's numeric suffix is a reliable proxy for
+  // filing order within a tied day, since Jira keys are assigned sequentially.
   const result = await pool.request().query(`
-    SELECT TOP ${RECENT_REPORTS_LIMIT} issue_key, safety_report_type, status_category, created_date
+    SELECT TOP ${RECENT_REPORTS_LIMIT} issue_key, description, safety_report_type, status_category, created_date
     FROM dbo.safety_reports
-    ORDER BY created_date DESC
+    WHERE status <> 'Cancelled'
+    ORDER BY created_date DESC, TRY_CAST(RIGHT(issue_key, LEN(issue_key) - CHARINDEX('-', issue_key)) AS INT) DESC
   `);
   return result.recordset.map((r) => ({
     issueKey: r.issue_key,
+    title: r.description,
     reportType: r.safety_report_type,
     statusCategory: r.status_category,
     createdDate: r.created_date,
@@ -70,7 +91,7 @@ async function getTimeToReport(pool) {
   const result = await pool.request().query(`
     SELECT TOP ${TIME_TO_REPORT_LIMIT} issue_key, occurrence_date, days_to_report
     FROM dbo.safety_reports
-    WHERE occurrence_date IS NOT NULL
+    WHERE occurrence_date IS NOT NULL AND status <> 'Cancelled'
     ORDER BY occurrence_date DESC
   `);
   return result.recordset
