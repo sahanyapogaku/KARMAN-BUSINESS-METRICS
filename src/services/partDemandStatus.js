@@ -15,6 +15,12 @@ const FULFILLED_BY_LABEL = {
   PlannedPurchaseOrder: "PO (planned)",
 };
 
+const ORPHAN_FULFILLED_BY_LABEL = {
+  OrphanInventory: "Inventory (Orphan)",
+  OrphanPurchaseOrderLine: "PO (Orphan)",
+  OrphanWipTrace: "WIP (Orphan)",
+};
+
 // mgfo.summary_report_view mirrors Manufacturo's mrp.SummaryReportView (synced
 // on-prem nightly by mgfo_replica_2/extract_to_onprem.py) — a decoded view over
 // the raw mrp.scheduled_object table (Type/PedigreeCode as text, no hand-decoding
@@ -68,7 +74,7 @@ async function getDemandLines(pool, productIds) {
   const request = pool.request();
   const idList = bindProductIdList(request, productIds);
   const result = await request.query(`
-    SELECT s.ScheduledObjectId, s.SourceId, s.DueDate, s.Quantity,
+    SELECT s.ScheduledObjectId, s.SourceId, s.DueDate, s.Quantity, s.PedigreeCode,
       ${DEFAULT_REVISION_SUBQUERY} AS DefaultRevision
     FROM mgfo.summary_report_view s
     WHERE s.Type = '${DEMAND_TYPE}' AND s.ProductId IN (${idList})
@@ -78,6 +84,7 @@ async function getDemandLines(pool, productIds) {
     id: r.ScheduledObjectId,
     needDate: r.DueDate,
     rev: r.DefaultRevision,
+    pedigree: r.PedigreeCode,
     quantity: r.Quantity,
     remaining: r.Quantity,
     sourceId: r.SourceId,
@@ -88,12 +95,25 @@ async function getDemandLines(pool, productIds) {
 // (PO# + rev). PlannedWorkOrder/PlannedPurchaseOrder have no mirrored raw table
 // yet (MRP hasn't created a real WO/PO for them) — reference stays null for
 // those two, but rev falls back to the default-revision subquery.
+// order_line_status_code on mgfo.purchase_order_overview is 'COMPLETED' when
+// quantity_completed == quantity_ordered (checked live against sample rows),
+// 'IN_PROGRESS' otherwise — order_line_quantity_ready_to_receive is NULL on
+// every row checked, not usable. purchase_order_overview has no lot-level
+// location (only order_header_site_code, coarser than inventory_overview's
+// site/area/location) and no join key back to a specific inventory lot, so
+// a COMPLETED line surfaces the site it was received at, not an exact rack.
+function poLineLocation(isPoType, statusCode, siteCode) {
+  if (!isPoType) return null;
+  return statusCode === "COMPLETED" ? siteCode || "Received" : "Supplier In Progress";
+}
+
 async function getSupplyLines(pool, productIds) {
   const request = pool.request();
   const idList = bindProductIdList(request, productIds);
   const result = await request.query(`
     SELECT s.ScheduledObjectId, s.SourceId, s.Type, s.EcdDate, s.Quantity, s.PedigreeCode,
       po.order_header_number, po.order_line_product_revision,
+      po.order_line_status_code, po.order_header_site_code,
       ${DEFAULT_REVISION_SUBQUERY} AS DefaultRevision
     FROM mgfo.summary_report_view s
     LEFT JOIN mgfo.purchase_order_overview po ON s.Type = 'PurchaseOrderLine' AND po.order_line_id = s.SourceId
@@ -101,8 +121,9 @@ async function getSupplyLines(pool, productIds) {
     ORDER BY s.EcdDate ASC
   `);
   return result.recordset.map((r) => {
-    const reference = r.Type === "PurchaseOrderLine" ? r.order_header_number : null;
-    const instanceRev = r.Type === "PurchaseOrderLine" ? r.order_line_product_revision : null;
+    const isPoType = r.Type === "PurchaseOrderLine";
+    const reference = isPoType ? r.order_header_number : null;
+    const instanceRev = isPoType ? r.order_line_product_revision : null;
     const rev = instanceRev ?? r.DefaultRevision;
     return {
       id: r.ScheduledObjectId,
@@ -114,7 +135,7 @@ async function getSupplyLines(pool, productIds) {
       pedigree: r.PedigreeCode,
       fulfilledBy: FULFILLED_BY_LABEL[r.Type],
       reference,
-      location: null, // no physical location for a PO line or planned order
+      location: poLineLocation(isPoType, r.order_line_status_code, r.order_header_site_code),
       source: r.Type,
     };
   });
@@ -182,9 +203,13 @@ async function getBlockedInventoryLots(pool, productIds) {
 // Multiple scheduled_object rows can share the same SourceId (the same real
 // PO line / inventory record surfacing once per MRP run in the snapshot) —
 // checked live: one part had 37 orphan rows all pointing at a single PO line.
-// Grouping by (Type, SourceId) and summing Quantity collapses those into one
-// real orphan per underlying PO line, with SourceId resolved to an actual PO#
-// for OrphanPurchaseOrderLine the same way getSupplyLines resolves it.
+// These are exact repeats of the same line (identical Quantity each time),
+// not distinct quantities to add up — SUM(Quantity) multiplied the real qty
+// by the occurrence count (a qty-3 PO line duplicated 40x showed as 120).
+// MAX(Quantity) takes the real per-line quantity once; COUNT(*) still feeds
+// the "(Nx)" occurrences hint, just no longer folded into the qty itself.
+// SourceId is resolved to an actual PO# for OrphanPurchaseOrderLine the same
+// way getSupplyLines resolves it.
 //
 // OrphanInventory does NOT get the same reference/location treatment: like
 // the "Inventory" supply type, its SourceId equals ProductId (checked live,
@@ -201,29 +226,46 @@ async function getBlockedInventoryLots(pool, productIds) {
 async function getOrphans(pool, productIds) {
   const request = pool.request();
   const idList = bindProductIdList(request, productIds);
+  // Alias is `s` (not `o`) so DEFAULT_REVISION_SUBQUERY's hardcoded `s.ProductId`
+  // correlation works unchanged. SQL Server rejects MAX() wrapped around a
+  // subquery ("aggregate function on an expression containing ... a
+  // subquery") — so ProductId joins GROUP BY instead (safe: constant per
+  // SourceId, same duplicate-row case the rest of this function handles) and
+  // the subquery is selected directly rather than aggregated.
   const result = await request.query(`
     SELECT
-      o.Type, o.SourceId,
-      SUM(o.Quantity) AS totalQuantity,
+      s.Type, s.SourceId,
+      MAX(s.Quantity) AS totalQuantity,
       COUNT(*) AS occurrences,
-      MAX(o.PedigreeCode) AS pedigree,
-      MAX(po.order_header_number) AS poReference
-    FROM mgfo.summary_report_view o
-    LEFT JOIN mgfo.purchase_order_overview po ON o.Type = 'OrphanPurchaseOrderLine' AND po.order_line_id = o.SourceId
-    WHERE o.Type IN (${ORPHAN_TYPES.map((t) => `'${t}'`).join(",")}) AND o.ProductId IN (${idList})
-    GROUP BY o.Type, o.SourceId
+      MAX(s.PedigreeCode) AS pedigree,
+      MAX(s.EcdDate) AS ecdDate,
+      MAX(po.order_header_number) AS poReference,
+      MAX(po.order_line_product_revision) AS orderLineProductRevision,
+      MAX(po.order_line_status_code) AS orderLineStatusCode,
+      MAX(po.order_header_site_code) AS orderHeaderSiteCode,
+      ${DEFAULT_REVISION_SUBQUERY} AS defaultRevision
+    FROM mgfo.summary_report_view s
+    LEFT JOIN mgfo.purchase_order_overview po ON s.Type = 'OrphanPurchaseOrderLine' AND po.order_line_id = s.SourceId
+    WHERE s.Type IN (${ORPHAN_TYPES.map((t) => `'${t}'`).join(",")}) AND s.ProductId IN (${idList})
+    GROUP BY s.Type, s.SourceId, s.ProductId
     ORDER BY totalQuantity DESC
   `);
-  return result.recordset.map((r) => ({
-    sourceId: r.SourceId,
-    type: r.Type,
-    reference: r.poReference || null,
-    poReference: r.poReference || null,
-    location: null,
-    quantity: r.totalQuantity,
-    occurrences: r.occurrences,
-    pedigree: r.pedigree,
-  }));
+  return result.recordset.map((r) => {
+    const isPoType = r.Type === "OrphanPurchaseOrderLine";
+    const instanceRev = isPoType ? r.orderLineProductRevision : null;
+    return {
+      sourceId: r.SourceId,
+      type: r.Type,
+      reference: r.poReference || null,
+      poReference: r.poReference || null,
+      location: poLineLocation(isPoType, r.orderLineStatusCode, r.orderHeaderSiteCode),
+      estimatedCompletionDate: r.ecdDate,
+      quantity: r.totalQuantity,
+      occurrences: r.occurrences,
+      pedigree: r.pedigree,
+      rev: instanceRev ?? r.defaultRevision,
+    };
+  });
 }
 
 async function getPartHeader(pool, partNumber) {
@@ -277,7 +319,7 @@ function allocate(demandLines, supplyLines) {
       }
       const qty = Math.min(remaining, s.remaining);
       rows.push({
-        demand: { needDate: d.needDate, rev: d.rev, quantity: qty },
+        demand: { needDate: d.needDate, rev: d.rev, pedigree: d.pedigree, quantity: qty },
         supply: {
           estimatedCompletionDate: s.estimatedCompletionDate,
           rev: s.rev,
@@ -295,13 +337,33 @@ function allocate(demandLines, supplyLines) {
 
     if (remaining > 0) {
       rows.push({
-        demand: { needDate: d.needDate, rev: d.rev, quantity: remaining },
+        demand: { needDate: d.needDate, rev: d.rev, pedigree: d.pedigree, quantity: remaining },
         supply: null,
       });
     }
   }
 
-  return { rows, remainingSupply: supply.filter((s) => s.remaining > 0) };
+  // Zero demand lines for this part: every supply line is orphaned by
+  // definition, not leftover from a match — show each as its own row
+  // (no demand to peg against) instead of dropping them from the table.
+  if (demand.length === 0) {
+    for (const s of supply) {
+      rows.push({
+        demand: { needDate: null, rev: null, pedigree: null, quantity: 0 },
+        supply: {
+          estimatedCompletionDate: s.estimatedCompletionDate,
+          rev: s.rev,
+          fulfilledBy: s.fulfilledBy,
+          reference: s.reference,
+          location: s.location,
+          pedigree: s.pedigree,
+          quantity: s.remaining,
+        },
+      });
+    }
+  }
+
+  return { rows, remainingSupply: demand.length === 0 ? [] : supply.filter((s) => s.remaining > 0) };
 }
 
 export async function getPartDemandStatus(partNumber) {
@@ -311,7 +373,7 @@ export async function getPartDemandStatus(partNumber) {
   const header = await getPartHeader(azurePool, partNumber);
   const productIds = await resolveProductIds(mgfoPool, partNumber);
   if (!productIds.length) {
-    return { header, allocation: [], availableSupply: [], blockedInventory: [], orphans: [] };
+    return { header, allocation: [], availableSupply: [], blockedInventory: [] };
   }
 
   const [demandLines, poSupplyLines, inventoryLots, blockedInventory, orphans] = await Promise.all([
@@ -322,7 +384,7 @@ export async function getPartDemandStatus(partNumber) {
     getOrphans(mgfoPool, productIds),
   ]);
 
-  const { rows: allocation, remainingSupply } = allocate(demandLines, [...inventoryLots, ...poSupplyLines]);
+  const { rows: allocationRows, remainingSupply } = allocate(demandLines, [...inventoryLots, ...poSupplyLines]);
   const availableSupply = remainingSupply
     .filter((s) => s.source === "Inventory")
     .map(({ rev, remaining, reference, location, pedigree }) => ({
@@ -333,11 +395,27 @@ export async function getPartDemandStatus(partNumber) {
       pedigree,
     }));
 
+  // MRP-flagged orphans (never pegged to any demand, regardless of whether
+  // this part has other open demand) are just supply with no demand side —
+  // shown as their own rows here instead of a separate table.
+  const orphanRows = orphans.map((o) => ({
+    demand: { needDate: null, rev: null, pedigree: null, quantity: 0 },
+    supply: {
+      estimatedCompletionDate: o.estimatedCompletionDate,
+      rev: o.rev,
+      fulfilledBy: ORPHAN_FULFILLED_BY_LABEL[o.type] || o.type,
+      reference: o.reference,
+      location: o.location,
+      pedigree: o.pedigree,
+      quantity: o.quantity,
+      occurrences: o.occurrences,
+    },
+  }));
+
   return {
     header,
-    allocation,
+    allocation: [...allocationRows, ...orphanRows],
     availableSupply,
     blockedInventory,
-    orphans,
   };
 }

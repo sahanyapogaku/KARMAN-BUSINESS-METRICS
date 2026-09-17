@@ -1,7 +1,6 @@
 import { getKarmanSqlPool } from "../config/tcDb.js";
 
 const RECENT_REPORTS_LIMIT = 10;
-const TIME_TO_REPORT_LIMIT = 20;
 const OLDEST_OPEN_ACTIONS_LIMIT = 10;
 const LEADING_LAGGING_TARGET_RATIO = 20;
 
@@ -37,8 +36,6 @@ async function getTrir(pool) {
     SELECT COUNT(*) AS cnt FROM dbo.safety_reports WHERE osha_recordable = 'Yes' AND status <> 'Cancelled'
   `);
   return {
-    available: false,
-    reason: "Hours worked data not yet connected — TRIR unavailable",
     oshaRecordableCount: result.recordset[0].cnt,
   };
 }
@@ -87,20 +84,27 @@ async function getRecentReports(pool) {
   }));
 }
 
+// No TOP-N limit here: the chart now groups every report into a per-month
+// 100% stacked bar, so it needs the full history to fill out each month
+// rather than just the most recent N individual reports.
+// GROUP BY issue_key guards against duplicate rows per ticket (the same
+// issue appearing more than once in dbo.safety_reports would otherwise
+// render as several thin stripes for what should be a single segment) —
+// occurrence_date/days_to_report are identical across any duplicates for a
+// given ticket, so MAX() is a safe pick, not a real aggregation.
 async function getTimeToReport(pool) {
   const result = await pool.request().query(`
-    SELECT TOP ${TIME_TO_REPORT_LIMIT} issue_key, occurrence_date, days_to_report
+    SELECT issue_key, MAX(occurrence_date) AS occurrenceDate, MAX(days_to_report) AS daysToReport
     FROM dbo.safety_reports
     WHERE occurrence_date IS NOT NULL AND status <> 'Cancelled'
-    ORDER BY occurrence_date DESC
+    GROUP BY issue_key
+    ORDER BY occurrenceDate ASC
   `);
-  return result.recordset
-    .map((r) => ({
-      issueKey: r.issue_key,
-      occurrenceDate: r.occurrence_date,
-      daysToReport: r.days_to_report,
-    }))
-    .reverse();
+  return result.recordset.map((r) => ({
+    issueKey: r.issue_key,
+    occurrenceDate: r.occurrenceDate,
+    daysToReport: r.daysToReport,
+  }));
 }
 
 // Widgets 5 & 6 (further-action aging + oldest open further actions) both filter

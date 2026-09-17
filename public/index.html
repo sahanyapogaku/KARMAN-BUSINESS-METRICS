@@ -101,6 +101,8 @@
   .card.clickable:hover { border-color: var(--accent); background: var(--panel-2); }
   .card .value.red { color: var(--red); }
   .card .value.green { color: var(--green); }
+  .card.compact { padding: 10px 14px; }
+  .card.compact .value { font-size: 20px; margin-top: 2px; }
 
   .chart-row {
     display: grid;
@@ -330,7 +332,6 @@ const APPROVAL_STATUS_LABELS = {
   "No PO in Brex memo": "No PO In Brex Memo",
   "No Jira approval found": "No Jira Approval Found",
   "Awaiting Invoice": "Awaiting Invoice",
-  "Not yet received": "Not Yet Received",
   "Fully validated": "Approved",
   "Within 10% of approved amount": "Within 10% Of Approved Amount",
   "Over Authorized Amount": "Over Authorized Amount",
@@ -346,7 +347,7 @@ const APPROVAL_STATUS_ACCENT = {
   "No PO in Brex memo": "#3B82F6",
   "No Jira approval found": "#7DD3FC",
   "Over Authorized Amount": "var(--red)",
-  "Not yet received": "var(--amber)",
+  "Awaiting Invoice": "var(--amber)",
 };
 
 // One color per category, shared by the pie chart and the $ Approval table
@@ -527,27 +528,31 @@ async function loadThreeWayMatch(main) {
   const slices = data.buckets.map((b) => ({ label: formatApprovalStatus(b.label), value: b.count, color: approvalColorMap[b.label] }));
 
   main.innerHTML = `
-    <div class="stat-grid">
-      <div class="card">
-        <div class="label">Total Records</div>
-        <div class="value">${data.total}</div>
-      </div>
-      <div class="card clickable" id="twm-matched-card">
-        <div class="label">Fully Matched</div>
-        <div class="value green">${data.matched}</div>
-      </div>
-      <div class="card">
-        <div class="label">Mismatched</div>
-        <div class="value ${data.mismatched > 0 ? "red" : "green"}">${data.mismatched}</div>
-      </div>
-    </div>
     <div class="chart-row">
-      <div class="chart-card">
-        <h2>By $ Approval</h2>
-        ${pieChartHtml(slices, { pct: true })}
+      <div style="display:flex;flex-direction:column;gap:16px">
+        <div class="card">
+          <div class="label">Total Records</div>
+          <div class="value">${data.total}</div>
+        </div>
+        <div class="chart-card">
+          <h2>By $ Approval</h2>
+          ${pieChartHtml(slices, { pct: true })}
+        </div>
+        <div class="card compact clickable" id="twm-matched-card">
+          <div class="label">Fully Matched</div>
+          <div class="value green">${data.matched}</div>
+        </div>
+        <div class="card compact">
+          <div class="label">Mismatched</div>
+          <div class="value ${data.mismatched > 0 ? "red" : "green"}">${data.mismatched}</div>
+        </div>
+        <div class="card compact">
+          <div class="label">Missing Data</div>
+          <div class="value ${data.missingData > 0 ? "red" : "green"}">${data.missingData}</div>
+        </div>
       </div>
       <div class="chart-card">
-        <h2 id="twm-title">Mismatches</h2>
+        <h2 id="twm-title">Records</h2>
         <div id="twm-filter-bar" class="filter-bar">
           <input id="twm-filter-invoice" type="text" class="text-input" placeholder="Invoice #" />
           <input id="twm-filter-supplier" type="text" class="text-input" placeholder="Supplier" />
@@ -582,7 +587,7 @@ async function loadThreeWayMatch(main) {
   const showNoPoCheckbox = document.getElementById("twm-show-no-po");
 
   const statusOptions = [...new Set(data.mismatches.map((m) => m.status_bucket).filter(Boolean))].sort();
-  statusSelect.innerHTML = `<option value="">All Statuses</option>` +
+  statusSelect.innerHTML = `<option value="">Status</option>` +
     statusOptions.map((s) => `<option value="${s}">${formatApprovalStatus(s)}</option>`).join("");
   const tbody = document.getElementById("twm-tbody");
   const countLabel = document.getElementById("twm-count");
@@ -605,9 +610,14 @@ async function loadThreeWayMatch(main) {
     const statusTerm = statusSelect.value;
     const showNoPo = showNoPoCheckbox.checked;
 
+    const filtersForNoPoStatus = statusTerm === "No PO in Brex memo";
+
     const filtered = data.mismatches.filter((m) => {
       const hasPo = m.po_number != null && m.po_number !== "";
-      if (!showNoPo && !hasPo) return false;
+      // The no-PO hide-by-default only makes sense while browsing everything —
+      // once you've explicitly picked the "No PO" status, hiding no-PO rows
+      // would leave every match filtered out no matter what (this exact bug).
+      if (!showNoPo && !filtersForNoPoStatus && !hasPo) return false;
       if (invoiceTerm && !(m.invoice_number || "").toLowerCase().includes(invoiceTerm)) return false;
       if (supplierTerm && !(m.supplier || "").toLowerCase().includes(supplierTerm)) return false;
       if (poTerm && !(m.po_number || "").toLowerCase().includes(poTerm)) return false;
@@ -629,7 +639,7 @@ async function loadThreeWayMatch(main) {
 
   function showMismatches() {
     mode = "mismatches";
-    titleEl.textContent = "Mismatches";
+    titleEl.textContent = "Records";
     filterBar.style.display = "flex";
     backRow.style.display = "none";
     renderRows();
@@ -730,9 +740,19 @@ function allocationTableHtml(rows) {
     const s = r.supply;
     const completionLabel = s && s.estimatedCompletionDate
       ? fmtDate(s.estimatedCompletionDate)
+      // Physical inventory (matched or orphaned) is either on hand now or it
+      // doesn't exist — there's no future "scheduled" state for it, unlike a
+      // PO or work order still in progress. Matched "Inventory" rows are
+      // pulled from inventory_overview WHERE inventory_status = 'AVAILABLE',
+      // a real verified status. Orphan inventory has no per-lot status MRP
+      // exposes (see getOrphans() comment) — we're trusting MRP's own
+      // Type = 'OrphanInventory' classification, not independently
+      // confirming availability, hence "unverified".
       : s && s.fulfilledBy === "Inventory"
         ? "In stock"
-        : "Not yet scheduled";
+        : s && s.fulfilledBy === "Inventory (Orphan)"
+          ? "In stock (unverified)"
+          : "Not yet scheduled";
     const supplyCells = s
       ? `
         <td>${completionLabel}</td>
@@ -749,6 +769,7 @@ function allocationTableHtml(rows) {
       <tr>
         <td>${fmtDate(d.needDate)}</td>
         <td>${demandRev}</td>
+        <td>${d.pedigree || "—"}</td>
         <td class="col-divider">${d.quantity}</td>
         ${supplyCells}
       </tr>
@@ -760,37 +781,17 @@ function allocationTableHtml(rows) {
       <table>
         <thead>
           <tr>
-            <th colspan="3" style="text-align:center">Demand</th>
+            <th colspan="4" style="text-align:center">Demand</th>
             <th colspan="7" style="text-align:center">Supply</th>
           </tr>
           <tr>
-            <th>Need Date</th><th>Rev</th><th class="col-divider">Qty Demanded</th>
+            <th>Need Date</th><th>Rev</th><th>Pedigree</th><th class="col-divider">Qty Demanded</th>
             <th>Est. Completion</th><th>Rev</th><th>Fulfilled By</th><th>Reference</th><th>Location</th><th>Pedigree</th><th>Qty</th>
           </tr>
         </thead>
         <tbody>${body}</tbody>
       </table>
     </div>
-  `;
-}
-
-function orphansHtml(rows) {
-  if (!rows.length) return "";
-  const body = rows.map((r) => `
-    <tr>
-      <td>${r.type}</td>
-      <td>${r.poReference || r.reference || "—"}</td>
-      <td>${r.location || "—"}</td>
-      <td>${r.quantity}${r.occurrences > 1 ? ` <span style="color:var(--muted)">(${r.occurrences}x)</span>` : ""}</td>
-      <td>${r.pedigree || "—"}</td>
-    </tr>
-  `).join("");
-  return `
-    <h2 style="margin-top:24px">Orphans (not allocated)</h2>
-    <table>
-      <thead><tr><th>Type</th><th>PO / Reference</th><th>Location</th><th>Qty</th><th>Pedigree</th></tr></thead>
-      <tbody>${body}</tbody>
-    </table>
   `;
 }
 
@@ -855,7 +856,6 @@ async function loadPartDemandStatus(main) {
         ${allocationTableHtml(data.allocation)}
         ${inventoryLotsHtml("Available Supply (not currently needed)", data.availableSupply || [])}
         ${inventoryLotsHtml("Blocked / On-Hold Inventory", data.blockedInventory || [], { showStatus: true, showNonConformance: true })}
-        ${orphansHtml(data.orphans)}
       `;
     } catch (err) {
       results.innerHTML = `<div class="error">Failed to load part demand status: ${err.message}</div>`;
@@ -881,14 +881,55 @@ function agingBucketFor(ageDays) {
   return ">60d";
 }
 
-// Blocked-state meter: no needle, no severity bands — there's no reading to show yet.
-function gaugeBlockedHtml(reason) {
+function polarPoint(cx, cy, r, angleDeg) {
+  const rad = (angleDeg * Math.PI) / 180;
+  return { x: cx + r * Math.cos(rad), y: cy - r * Math.sin(rad) };
+}
+
+function arcPath(cx, cy, r, startAngle, endAngle) {
+  const start = polarPoint(cx, cy, r, startAngle);
+  const end = polarPoint(cx, cy, r, endAngle);
+  const largeArc = Math.abs(startAngle - endAngle) > 180 ? 1 : 0;
+  return `M${start.x},${start.y} A${r},${r} 0 ${largeArc},1 ${end.x},${end.y}`;
+}
+
+// TCIR placeholder: plots the raw recordable-incident count, not incidents
+// per 200k hours — real TRIR needs hours_worked, still unconnected (see
+// getTrir() in safetyMetrics.js). Bands: 0-1 green, 1-3 yellow, >3 red;
+// gauge domain capped at 6 so the red band has a real span to point into.
+const TCIR_GAUGE_MAX = 6;
+const TCIR_BANDS = [
+  { from: 0, to: 1, color: "var(--status-good)" },
+  { from: 1, to: 3, color: "var(--status-warning)" },
+  { from: 3, to: TCIR_GAUGE_MAX, color: "var(--status-critical)" },
+];
+function tcirAngle(value) {
+  const clamped = Math.max(0, Math.min(value, TCIR_GAUGE_MAX));
+  return 180 * (1 - clamped / TCIR_GAUGE_MAX);
+}
+// Band boundaries plus the scale max — the minimum scale readers need to
+// place the needle without guessing.
+const TCIR_TICKS = [0, 1, 3, TCIR_GAUGE_MAX];
+function tcirTickLabelHtml(v) {
+  const pt = polarPoint(100, 100, 100, tcirAngle(v));
+  const anchor = pt.x < 96 ? "end" : pt.x > 104 ? "start" : "middle";
+  return `<text x="${pt.x.toFixed(1)}" y="${pt.y.toFixed(1)}" text-anchor="${anchor}" dominant-baseline="middle" font-size="9" fill="var(--muted)">${fmtNum(v)}</text>`;
+}
+function tcirGaugeHtml(value) {
+  const bandArcs = TCIR_BANDS.map((b) =>
+    `<path d="${arcPath(100, 100, 90, tcirAngle(b.from), tcirAngle(b.to))}" fill="none" stroke="${b.color}" stroke-width="16" />`
+  ).join("");
+  const tickLabels = TCIR_TICKS.map(tcirTickLabelHtml).join("");
+  const tip = polarPoint(100, 100, 78, tcirAngle(value));
   return `
     <div class="gauge-wrap">
-      <svg class="gauge" viewBox="0 0 200 110" aria-hidden="true">
-        <path d="M10,100 A90,90 0 0,1 190,100" fill="none" stroke="var(--border)" stroke-width="16" stroke-linecap="round" />
+      <svg class="gauge" viewBox="-20 -16 240 140" aria-hidden="true">
+        ${bandArcs}
+        ${tickLabels}
+        <line x1="100" y1="100" x2="${tip.x.toFixed(1)}" y2="${tip.y.toFixed(1)}" stroke="var(--text)" stroke-width="3" stroke-linecap="round" />
+        <circle cx="100" cy="100" r="5" fill="var(--text)" />
       </svg>
-      <div class="gauge-caption">${reason}</div>
+      <div class="gauge-caption">${fmtNum(value)}</div>
     </div>
   `;
 }
@@ -924,23 +965,30 @@ function donutChartHtml(slices) {
   `;
 }
 
-// Single-series trend line against a dashed target reference line. No legend box
-// (one series — the card title already names it); the target is direct-labeled inline.
-function lineChartWithTargetHtml(points, target) {
+// Stacked bars (leading + lagging counts per period, left axis: # Reports)
+// plus the real leading:lagging ratio per period as a line against its own
+// right axis (getLeadingLaggingTrend already computes this ratio — it's the
+// same series the old single-line chart plotted, just layered onto the bars
+// instead of replacing them). The target is dimensionally a ratio, so its
+// dashed reference line now reads off the right axis too, not the left one.
+function stackedBarChartHtml(points, target) {
   const width = 480, height = 160;
-  const pad = { top: 16, right: 8, bottom: 8, left: 28 };
+  const pad = { top: 16, right: 34, bottom: 8, left: 38 };
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
-  const finiteValues = points.map((p) => p.y).filter((v) => v != null);
-  const maxVal = Math.max(target * 1.15, ...finiteValues, 1);
-  const xStep = points.length > 1 ? plotW / (points.length - 1) : 0;
-  const xScale = (i) => pad.left + i * xStep;
-  const yScale = (v) => pad.top + plotH - (Math.min(v, maxVal) / maxVal) * plotH;
+  const totals = points.map((p) => (p.leadingCount || 0) + (p.laggingCount || 0));
+  const maxVal = Math.max(...totals, 1) * 1.15;
+  const n = points.length;
+  const slot = n ? plotW / n : plotW;
+  const barW = slot;
+  const yScale = (v) => pad.top + plotH - (v / maxVal) * plotH;
 
-  if (!points.length) return `<div class="loading" style="padding:40px 0">No data yet</div>`;
+  const ratioValues = points.map((p) => p.ratio).filter((v) => v != null);
+  const maxRatio = Math.max(target * 1.15, ...ratioValues, 1);
+  const yScaleRatio = (v) => pad.top + plotH - (Math.min(v, maxRatio) / maxRatio) * plotH;
 
-  // Y-axis: 4 evenly spaced ticks from 0 to the chart's own max, rounded to
-  // clean numbers per the dashboard's axis-label convention elsewhere.
+  if (!n) return `<div class="loading" style="padding:40px 0">No data yet</div>`;
+
   const tickCount = 4;
   const ticks = Array.from({ length: tickCount + 1 }, (_, i) => Math.round((maxVal / tickCount) * i));
   const axisHtml = ticks.map((t) => {
@@ -951,39 +999,66 @@ function lineChartWithTargetHtml(points, target) {
     `;
   }).join("");
 
-  // Break the line at any month with no data instead of connecting straight
-  // across the gap (which would visually imply a trend that isn't there).
-  // Segments are grouped by index-adjacency, not just by filtering out nulls,
-  // so two data points on either side of a gap never get joined.
+  const ratioTicks = Array.from({ length: tickCount + 1 }, (_, i) => (maxRatio / tickCount) * i);
+  const ratioAxisHtml = ratioTicks.map((t) => {
+    const y = yScaleRatio(t);
+    return `<text x="${width - pad.right + 6}" y="${y}" text-anchor="start" dominant-baseline="middle" font-size="10" fill="var(--accent-2)">${t.toFixed(0)}</text>`;
+  }).join("");
+
+  const bars = points.map((p, i) => {
+    const x = pad.left + i * slot;
+    const leading = p.leadingCount || 0;
+    const lagging = p.laggingCount || 0;
+    const leadingY = yScale(leading);
+    const leadingH = pad.top + plotH - leadingY;
+    const stackTopY = yScale(leading + lagging);
+    const laggingH = leadingY - stackTopY;
+    return `
+      <rect x="${x.toFixed(1)}" y="${leadingY.toFixed(1)}" width="${barW.toFixed(1)}" height="${leadingH.toFixed(1)}" fill="var(--green)"><title>${p.x}: ${leading} leading</title></rect>
+      <rect x="${x.toFixed(1)}" y="${stackTopY.toFixed(1)}" width="${barW.toFixed(1)}" height="${laggingH.toFixed(1)}" fill="var(--accent)"><title>${p.x}: ${lagging} lagging</title></rect>
+    `;
+  }).join("");
+
+  // Ratio line: break at any month with no ratio (no lagging reports to
+  // divide by) instead of bridging the gap — same rule the old line chart used.
   const segments = [];
   let current = [];
   points.forEach((p, i) => {
-    if (p.y == null) {
+    if (p.ratio == null) {
       if (current.length) segments.push(current);
       current = [];
     } else {
-      current.push(`${xScale(i)},${yScale(p.y)}`);
+      current.push({ x: pad.left + i * slot + slot / 2, y: yScaleRatio(p.ratio), label: p.x, value: p.ratio });
     }
   });
   if (current.length) segments.push(current);
-  const polylines = segments
-    .map((seg) => `<polyline points="${seg.join(" ")}" fill="none" stroke="var(--accent-2)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />`)
+  const ratioLines = segments
+    .map((seg) => `<polyline points="${seg.map((pt) => `${pt.x.toFixed(1)},${pt.y.toFixed(1)}`).join(" ")}" fill="none" stroke="var(--accent-2)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />`)
     .join("");
+  const ratioDots = segments.flatMap((seg) => seg.map((pt) =>
+    `<circle cx="${pt.x.toFixed(1)}" cy="${pt.y.toFixed(1)}" r="3.5" fill="var(--accent-2)" stroke="var(--panel)" stroke-width="2"><title>${pt.label}: ${pt.value.toFixed(1)}:1</title></circle>`
+  )).join("");
 
-  const dots = points
-    .map((p, i) => p.y == null ? "" : `<circle cx="${xScale(i)}" cy="${yScale(p.y)}" r="4" fill="var(--accent-2)" stroke="var(--panel)" stroke-width="2"><title>${p.x}: ${p.y.toFixed(1)}:1</title></circle>`)
-    .join("");
-  const targetY = yScale(target);
+  const targetY = yScaleRatio(target);
 
   return `
-    <svg class="line-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+    <svg class="bar-line-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
       ${axisHtml}
+      ${ratioAxisHtml}
+      ${bars}
       <line x1="${pad.left}" y1="${targetY}" x2="${width - pad.right}" y2="${targetY}" stroke="var(--muted)" stroke-width="1" stroke-dasharray="4 4" />
       <text x="${width - pad.right}" y="${targetY - 6}" text-anchor="end" font-size="10" fill="var(--muted)">target ${target}:1</text>
-      ${polylines}
-      ${dots}
+      ${ratioLines}
+      ${ratioDots}
+      <text x="10" y="${pad.top + plotH / 2}" text-anchor="middle" font-size="10" fill="var(--muted)" transform="rotate(-90 10 ${pad.top + plotH / 2})"># Reports</text>
+      <text x="${width - 8}" y="${pad.top + plotH / 2}" text-anchor="middle" font-size="10" fill="var(--accent-2)" transform="rotate(90 ${width - 8} ${pad.top + plotH / 2})">Ratio</text>
     </svg>
     <div class="axis-footer"><span>${points[0].x}</span><span>${points[points.length - 1].x}</span></div>
+    <div class="mini-legend">
+      <span class="item"><span class="swatch" style="background:var(--green)"></span>Leading</span>
+      <span class="item"><span class="swatch" style="background:var(--accent)"></span>Lagging</span>
+      <span class="item"><span class="swatch" style="background:var(--accent-2)"></span>Leading:Lagging Ratio</span>
+    </div>
   `;
 }
 
@@ -994,50 +1069,98 @@ function lineChartWithTargetHtml(points, target) {
 // relabeled in two units (like °C/°F), not two independent y-scales, so a
 // single yScale() drives both bars and the trend line correctly.
 const REPORT_TARGET_DAYS = 7;
+// No confirmed severity thresholds either — assuming <=target green,
+// up to 2x target yellow, beyond that red (7/14 with the target above).
+function reportDaysColor(days) {
+  if (days <= REPORT_TARGET_DAYS) return "var(--status-good)";
+  if (days <= REPORT_TARGET_DAYS * 2) return "var(--status-warning)";
+  return "var(--status-critical)";
+}
 
-function timeToReportChartHtml(points) {
+// One bucket per calendar month from the first report to the last, with no
+// gaps — a month with zero reports still gets an entry (empty reports
+// array) instead of vanishing from the chart. Within a month, reports sort
+// chronologically by occurrenceDate (earliest first), matching the chart's
+// overall left-to-right time direction.
+function groupReportsByMonth(reports) {
+  const byKey = new Map();
+  reports.forEach((r) => {
+    const d = new Date(r.occurrenceDate);
+    const key = d.getUTCFullYear() * 12 + d.getUTCMonth();
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(r);
+  });
+  if (!byKey.size) return [];
+  const keys = [...byKey.keys()];
+  const minKey = Math.min(...keys);
+  const maxKey = Math.max(...keys);
+  const months = [];
+  for (let k = minKey; k <= maxKey; k++) {
+    const period = new Date(Date.UTC(Math.floor(k / 12), k % 12, 1));
+    const monthReports = (byKey.get(k) || [])
+      .slice()
+      .sort((a, b) => new Date(a.occurrenceDate) - new Date(b.occurrenceDate));
+    months.push({ period, reports: monthReports });
+  }
+  return months;
+}
+
+// 100% stacked bar per month: every report that month is its own segment
+// (not bucketed/averaged), sized 1/N of the bar and colored by its own
+// days-to-report threshold, linking straight to its Jira issue. A month
+// with no reports still renders as a full-height outlined empty box rather
+// than disappearing from the axis.
+function timeToReportChartHtml(reports) {
   const width = 480, height = 160;
-  const pad = { top: 12, right: 34, bottom: 8, left: 28 };
+  const pad = { top: 16, right: 8, bottom: 8, left: 32 };
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
-  const maxVal = Math.max(...points.map((p) => p.value), REPORT_TARGET_DAYS, 1) * 1.15;
-  const n = points.length;
-  const slot = n ? plotW / n : plotW;
-  const barW = slot; // 100% bars — full width, no gaps between them
-  const yScale = (v) => pad.top + plotH - (v / maxVal) * plotH;
 
+  const months = groupReportsByMonth(reports);
+  const n = months.length;
   if (!n) return `<div class="loading" style="padding:40px 0">No data yet</div>`;
+  const slot = plotW / n;
+  const barW = slot;
+  const MIN_LABEL_HEIGHT = 14; // below this, the "Nd" text won't fit — rely on the <title> hover instead
 
-  const tickCount = 4;
-  const ticks = Array.from({ length: tickCount + 1 }, (_, i) => Math.round((maxVal / tickCount) * i));
-  const axisHtml = ticks.map((t) => {
-    const y = yScale(t);
-    const pct = Math.round((t / REPORT_TARGET_DAYS) * 100);
+  const axisHtml = [0, 25, 50, 75, 100].map((pct) => {
+    const y = pad.top + plotH - (pct / 100) * plotH;
     return `
       <line x1="${pad.left}" y1="${y}" x2="${width - pad.right}" y2="${y}" stroke="var(--border)" stroke-width="1" />
-      <text x="${pad.left - 6}" y="${y}" text-anchor="end" dominant-baseline="middle" font-size="10" fill="var(--muted)">${t}</text>
-      <text x="${width - pad.right + 6}" y="${y}" text-anchor="start" dominant-baseline="middle" font-size="10" fill="var(--accent-2)">${pct}%</text>
+      <text x="${pad.left - 6}" y="${y}" text-anchor="end" dominant-baseline="middle" font-size="10" fill="var(--muted)">${pct}%</text>
     `;
   }).join("");
 
-  const bars = points.map((p, i) => {
+  const bars = months.map((m, i) => {
     const x = pad.left + i * slot;
-    const y = yScale(p.value);
-    const h = pad.top + plotH - y;
-    return `<a href="${jiraIssueUrl(p.issueKey)}" target="_blank" rel="noopener"><rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="var(--green)"><title>${p.issueKey}: ${p.value}d to report</title></rect></a>`;
+    if (!m.reports.length) {
+      return `<rect x="${x.toFixed(1)}" y="${pad.top.toFixed(1)}" width="${barW.toFixed(1)}" height="${plotH.toFixed(1)}" fill="none" stroke="var(--border)" stroke-width="1" stroke-dasharray="3 3"><title>${fmtMonth(m.period)}: no reports</title></rect>`;
+    }
+    const segH = plotH / m.reports.length;
+    return m.reports.map((r, j) => {
+      const y = pad.top + j * segH;
+      const label = segH >= MIN_LABEL_HEIGHT
+        ? `<text x="${(x + barW / 2).toFixed(1)}" y="${(y + segH / 2).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="9" font-weight="600" fill="var(--text)">${r.daysToReport}d</text>`
+        : "";
+      return `
+        <a href="${jiraIssueUrl(r.issueKey)}" target="_blank" rel="noopener">
+          <rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${segH.toFixed(1)}" fill="${reportDaysColor(r.daysToReport)}" stroke="var(--bg)" stroke-width="1.5"><title>${r.issueKey}: ${r.daysToReport}d to report</title></rect>
+          ${label}
+        </a>
+      `;
+    }).join("");
   }).join("");
-  const trendPoints = points.map((p, i) => `${(pad.left + i * slot + slot / 2).toFixed(1)},${yScale(p.trend).toFixed(1)}`).join(" ");
 
   return `
     <svg class="bar-line-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
       ${axisHtml}
       ${bars}
-      <polyline points="${trendPoints}" fill="none" stroke="var(--accent-2)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />
     </svg>
-    <div class="axis-footer"><span>${fmtDate(points[0].occurrenceDate)}</span><span>${fmtDate(points[points.length - 1].occurrenceDate)}</span></div>
+    <div class="axis-footer"><span>${fmtMonth(months[0].period)}</span><span>${fmtMonth(months[months.length - 1].period)}</span></div>
     <div class="mini-legend">
-      <span class="item"><span class="swatch" style="background:var(--green)"></span>Days to report</span>
-      <span class="item"><span class="swatch" style="background:var(--accent-2)"></span>3-report average (right axis: % of ${REPORT_TARGET_DAYS}d target, placeholder)</span>
+      <span class="item"><span class="swatch" style="background:var(--status-good)"></span>&le;${REPORT_TARGET_DAYS}d</span>
+      <span class="item"><span class="swatch" style="background:var(--status-warning)"></span>&le;${REPORT_TARGET_DAYS * 2}d</span>
+      <span class="item"><span class="swatch" style="background:var(--status-critical)"></span>&gt;${REPORT_TARGET_DAYS * 2}d</span>
     </div>
   `;
 }
@@ -1079,35 +1202,24 @@ function fillMonthlyGaps(trend) {
   for (let k = minKey; k <= maxKey; k++) {
     const existing = byKey.get(k);
     const period = new Date(Date.UTC(Math.floor(k / 12), k % 12, 1));
-    filled.push({ period, ratio: existing ? existing.ratio : null });
+    filled.push({ period, ratio: existing ? existing.ratio : null, leadingCount: existing ? existing.leadingCount : 0, laggingCount: existing ? existing.laggingCount : 0 });
   }
   return filled;
-}
-
-function rollingAverage(values, windowSize) {
-  return values.map((_, i) => {
-    const start = Math.max(0, i - windowSize + 1);
-    const slice = values.slice(start, i + 1);
-    return slice.reduce((s, x) => s + x, 0) / slice.length;
-  });
 }
 
 async function loadSafetyOverview(main) {
   const data = await fetchJson("/api/metrics/safety/overview");
 
-  const leadingLaggingPoints = fillMonthlyGaps(data.leadingLaggingRatio.trend).map((t) => ({ x: fmtMonth(t.period), y: t.ratio }));
+  const leadingLaggingPoints = fillMonthlyGaps(data.leadingLaggingRatio.trend).map((t) => ({ x: fmtMonth(t.period), leadingCount: t.leadingCount, laggingCount: t.laggingCount, ratio: t.ratio }));
 
   const agingSlices = data.furtherActionAging.map((b) => ({ label: b.bucket, value: b.count, color: AGING_BUCKET_COLOR_VAR[b.bucket] }));
-
-  const trendValues = rollingAverage(data.timeToReport.map((p) => p.daysToReport), 3);
-  const timeToReportPoints = data.timeToReport.map((p, i) => ({ ...p, value: p.daysToReport, trend: trendValues[i] }));
 
   main.innerHTML = `
     <div class="widget-grid">
       <div class="chart-card">
-        <h2>TRIR</h2>
+        <h2>TCIR</h2>
         <div class="widget-body">
-          ${gaugeBlockedHtml(data.trir.reason)}
+          ${tcirGaugeHtml(data.trir.oshaRecordableCount)}
           <div class="stat-sub">
             <div class="label">OSHA Recordable Incidents (all-time)</div>
             <div class="value">${fmtNum(data.trir.oshaRecordableCount)}</div>
@@ -1116,7 +1228,7 @@ async function loadSafetyOverview(main) {
       </div>
       <div class="chart-card">
         <h2>Leading : Lagging Ratio</h2>
-        <div class="widget-body">${lineChartWithTargetHtml(leadingLaggingPoints, data.leadingLaggingRatio.targetRatio)}</div>
+        <div class="widget-body">${stackedBarChartHtml(leadingLaggingPoints, data.leadingLaggingRatio.targetRatio)}</div>
       </div>
       <div class="chart-card">
         <h2>Further Action Aging</h2>
@@ -1128,7 +1240,7 @@ async function loadSafetyOverview(main) {
       </div>
       <div class="chart-card">
         <h2>Time to Report</h2>
-        <div class="widget-body">${timeToReportChartHtml(timeToReportPoints)}</div>
+        <div class="widget-body">${timeToReportChartHtml(data.timeToReport)}</div>
       </div>
       <div class="chart-card">
         <h2>Oldest Open Further Actions</h2>

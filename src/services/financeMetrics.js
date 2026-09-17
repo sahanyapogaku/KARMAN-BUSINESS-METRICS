@@ -1,5 +1,28 @@
 import { getKarmanSqlPool } from "../config/tcDb.js";
 
+// "Not yet received" and "Awaiting Invoice" are both just "PO not resolved
+// yet" from a $ Approval standpoint. Also seeing "Awaiting Invoice" itself
+// split into two legend rows (84 + 18) with nothing but a case/whitespace
+// difference between the raw values usp_refresh_match_results writes — so
+// this normalizes trim+case before applying the synonym map, instead of
+// only matching one exact string.
+const BUCKET_LABEL_SYNONYMS = [["Awaiting Invoice", "Not yet received"]];
+
+// "No PO in Brex memo" and "No Jira approval found" are two distinct,
+// mutually exclusive status_bucket values (the $ Approval percentages sum to
+// 100%, confirming one bucket per record) — their intersection is always 0,
+// so "Missing Data" is their union (sum of both counts), not an overlap.
+const MISSING_DATA_LABELS = ["No PO in Brex memo", "No Jira approval found", "Awaiting Invoice"];
+function mergeBucketLabel(label) {
+  const trimmed = (label ?? "").trim();
+  for (const [canonical, ...aliases] of BUCKET_LABEL_SYNONYMS) {
+    if (trimmed.toLowerCase() === canonical.toLowerCase() || aliases.some((a) => a.toLowerCase() === trimmed.toLowerCase())) {
+      return canonical;
+    }
+  }
+  return trimmed;
+}
+
 export async function getThreeWayMatchSummary() {
   const pool = await getKarmanSqlPool("ThreeWayMatch");
 
@@ -48,16 +71,29 @@ export async function getThreeWayMatchSummary() {
     ORDER BY m.matched_at DESC
   `);
 
-  const buckets = summaryResult.recordset;
-  const total = buckets.reduce((s, b) => s + b.cnt, 0);
-  const matched = buckets.filter((b) => b.match_flag === "Match").reduce((s, b) => s + b.cnt, 0);
+  const total = summaryResult.recordset.reduce((s, b) => s + b.cnt, 0);
+  const matched = summaryResult.recordset.filter((b) => b.match_flag === "Match").reduce((s, b) => s + b.cnt, 0);
+
+  // $ Approval buckets are a label-only breakdown (the pie/legend has no
+  // notion of match_flag) — two raw rows with the same merged label but
+  // different match_flag must collapse into one slice, not stay split.
+  const labelCounts = new Map();
+  summaryResult.recordset.forEach((b) => {
+    const label = mergeBucketLabel(b.status_bucket);
+    labelCounts.set(label, (labelCounts.get(label) || 0) + b.cnt);
+  });
+  const buckets = [...labelCounts.entries()].map(([label, count]) => ({ label, count }));
+  const missingData = buckets
+    .filter((b) => MISSING_DATA_LABELS.includes(b.label))
+    .reduce((s, b) => s + b.count, 0);
 
   return {
     total,
     matched,
-    mismatched: total - matched,
-    buckets: buckets.map((b) => ({ label: b.status_bucket, matchFlag: b.match_flag, count: b.cnt })),
-    mismatches: mismatchesResult.recordset,
-    matchedRecords: matchedResult.recordset,
+    mismatched: total - matched - missingData,
+    missingData,
+    buckets,
+    mismatches: mismatchesResult.recordset.map((r) => ({ ...r, status_bucket: mergeBucketLabel(r.status_bucket) })),
+    matchedRecords: matchedResult.recordset.map((r) => ({ ...r, status_bucket: mergeBucketLabel(r.status_bucket) })),
   };
 }
