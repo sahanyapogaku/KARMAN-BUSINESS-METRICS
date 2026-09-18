@@ -368,7 +368,7 @@ function fmtMoney(n) {
 }
 function fmtMonth(d) {
   if (!d) return "—";
-  return new Date(d).toLocaleDateString("en-US", { month: "short", year: "2-digit" });
+  return new Date(d).toLocaleDateString("en-US", { month: "short", year: "2-digit", timeZone: "UTC" });
 }
 function fmtNum(n) {
   return n == null ? "—" : Number(n).toLocaleString("en-US");
@@ -1062,20 +1062,12 @@ function stackedBarChartHtml(points, target) {
   `;
 }
 
-// Bars (days to report) + a rolling-average trend line, sharing one axis (days).
-// No confirmed company policy for reporting turnaround — 7 days is a
-// placeholder for the right-axis "% of target" scale until a real value is
-// set. Left (days) and right (% of target) are the same linear scale just
-// relabeled in two units (like °C/°F), not two independent y-scales, so a
-// single yScale() drives both bars and the trend line correctly.
-const REPORT_TARGET_DAYS = 7;
-// No confirmed severity thresholds either — assuming <=target green,
-// up to 2x target yellow, beyond that red (7/14 with the target above).
-function reportDaysColor(days) {
-  if (days <= REPORT_TARGET_DAYS) return "var(--status-good)";
-  if (days <= REPORT_TARGET_DAYS * 2) return "var(--status-warning)";
-  return "var(--status-critical)";
-}
+const TIME_TO_REPORT_CATEGORIES = [
+  { label: "Same day", color: "var(--status-good)", test: (d) => d === 0 },
+  { label: "1–3 days", color: "var(--status-warning)", test: (d) => d >= 1 && d <= 3 },
+  { label: "4–7 days", color: "var(--status-serious)", test: (d) => d >= 4 && d <= 7 },
+  { label: ">7 days", color: "var(--status-critical)", test: (d) => d > 7 },
+];
 
 // One bucket per calendar month from the first report to the last, with no
 // gaps — a month with zero reports still gets an entry (empty reports
@@ -1136,17 +1128,21 @@ function timeToReportChartHtml(reports) {
     if (!m.reports.length) {
       return `<rect x="${x.toFixed(1)}" y="${pad.top.toFixed(1)}" width="${barW.toFixed(1)}" height="${plotH.toFixed(1)}" fill="none" stroke="var(--border)" stroke-width="1" stroke-dasharray="3 3"><title>${fmtMonth(m.period)}: no reports</title></rect>`;
     }
-    const segH = plotH / m.reports.length;
-    return m.reports.map((r, j) => {
-      const y = pad.top + j * segH;
+    const total = m.reports.length;
+    let yCursor = pad.top + plotH;
+    return TIME_TO_REPORT_CATEGORIES.map((c) => {
+      const count = m.reports.filter((r) => c.test(r.daysToReport)).length;
+      if (!count) return "";
+      const segH = (count / total) * plotH;
+      const y = yCursor - segH;
+      yCursor = y;
+      const pct = Math.round((count / total) * 100);
       const label = segH >= MIN_LABEL_HEIGHT
-        ? `<text x="${(x + barW / 2).toFixed(1)}" y="${(y + segH / 2).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="9" font-weight="600" fill="var(--text)">${r.daysToReport}d</text>`
+        ? `<text x="${(x + barW / 2).toFixed(1)}" y="${(y + segH / 2).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="9" font-weight="600" fill="var(--text)">${pct}%</text>`
         : "";
       return `
-        <a href="${jiraIssueUrl(r.issueKey)}" target="_blank" rel="noopener">
-          <rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${segH.toFixed(1)}" fill="${reportDaysColor(r.daysToReport)}" stroke="var(--bg)" stroke-width="1.5"><title>${r.issueKey}: ${r.daysToReport}d to report</title></rect>
-          ${label}
-        </a>
+        <rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${segH.toFixed(1)}" fill="${c.color}" stroke="var(--panel)" stroke-width="1"><title>${fmtMonth(m.period)}: ${c.label} — ${count}/${total} (${pct}%)</title></rect>
+        ${label}
       `;
     }).join("");
   }).join("");
@@ -1158,9 +1154,7 @@ function timeToReportChartHtml(reports) {
     </svg>
     <div class="axis-footer"><span>${fmtMonth(months[0].period)}</span><span>${fmtMonth(months[months.length - 1].period)}</span></div>
     <div class="mini-legend">
-      <span class="item"><span class="swatch" style="background:var(--status-good)"></span>&le;${REPORT_TARGET_DAYS}d</span>
-      <span class="item"><span class="swatch" style="background:var(--status-warning)"></span>&le;${REPORT_TARGET_DAYS * 2}d</span>
-      <span class="item"><span class="swatch" style="background:var(--status-critical)"></span>&gt;${REPORT_TARGET_DAYS * 2}d</span>
+      ${TIME_TO_REPORT_CATEGORIES.map((c) => `<span class="item"><span class="swatch" style="background:${c.color}"></span>${c.label}</span>`).join("")}
     </div>
   `;
 }
@@ -1181,7 +1175,8 @@ function oldestOpenActionsListHtml(actions) {
   return actions.map((a) => `
     <div class="mini-row">
       <a class="mini-key" href="${jiraIssueUrl(a.issueKey)}" target="_blank" rel="noopener">${a.issueKey}</a>
-      <span class="mini-main">${a.assignee || "Unassigned"}</span>
+      <span class="mini-main" title="${a.description || ""}">${a.description || ""}</span>
+      <span class="mini-sub">${(a.assignee || "Unassigned").split(" ")[0]}</span>
       <span class="mini-sub" style="color:${AGING_BUCKET_COLOR_VAR[agingBucketFor(a.ageDays)]}">${a.ageDays}d</span>
     </div>
   `).join("");

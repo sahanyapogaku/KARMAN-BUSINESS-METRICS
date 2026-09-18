@@ -118,6 +118,12 @@ async function getSupplyLines(pool, productIds) {
     FROM mgfo.summary_report_view s
     LEFT JOIN mgfo.purchase_order_overview po ON s.Type = 'PurchaseOrderLine' AND po.order_line_id = s.SourceId
     WHERE s.Type IN (${NON_INVENTORY_SUPPLY_TYPES.map((t) => `'${t}'`).join(",")}) AND s.ProductId IN (${idList})
+      -- Sites ending in _TEST (KRM01_TEST, TRANSIT_TEST) are Manufacturo's
+      -- test-environment mirrors of the real sites (KRM_01, TRANSIT) —
+      -- checked live: PO lines under POKRM01_TEST... are test data, not real
+      -- outstanding supply, so they're excluded the same way CANCELLED lines
+      -- are in getOrphans() below.
+      AND (po.order_header_site_code IS NULL OR RIGHT(po.order_header_site_code, 5) <> '_TEST')
     ORDER BY s.EcdDate ASC
   `);
   return result.recordset.map((r) => {
@@ -159,6 +165,9 @@ async function getInventoryLots(pool, productIds) {
       trace_serial_number, trace_lot_number, itag_code, site_code, area_code, location_code
     FROM mgfo.inventory_overview
     WHERE product_id IN (${idList}) AND inventory_status = 'AVAILABLE'
+      -- Test-site mirror (KRM01_TEST/TRANSIT_TEST) lots aren't real on-hand
+      -- stock — see getSupplyLines' comment for the same _TEST convention.
+      AND RIGHT(site_code, 5) <> '_TEST'
   `);
   return result.recordset.map((r) => ({
     id: r.inventory_id,
@@ -187,6 +196,7 @@ async function getBlockedInventoryLots(pool, productIds) {
       site_code, area_code, location_code
     FROM mgfo.inventory_overview
     WHERE product_id IN (${idList}) AND inventory_status <> 'AVAILABLE'
+      AND RIGHT(site_code, 5) <> '_TEST'
   `);
   return result.recordset.map((r) => ({
     id: r.inventory_id,
@@ -247,6 +257,17 @@ async function getOrphans(pool, productIds) {
     FROM mgfo.summary_report_view s
     LEFT JOIN mgfo.purchase_order_overview po ON s.Type = 'OrphanPurchaseOrderLine' AND po.order_line_id = s.SourceId
     WHERE s.Type IN (${ORPHAN_TYPES.map((t) => `'${t}'`).join(",")}) AND s.ProductId IN (${idList})
+      -- A cancelled line isn't real outstanding supply regardless of its
+      -- quantity — checked live: one such line (order_line_quantity_ordered
+      -- = 1) still carried an orphan Quantity of 148, clearly stale/garbage
+      -- data on a line nobody expects fulfilled.
+      AND NOT (s.Type = 'OrphanPurchaseOrderLine' AND po.order_line_status_code = 'CANCELLED')
+      -- Test-site (KRM01_TEST/TRANSIT_TEST) PO lines aren't real outstanding
+      -- supply either — same _TEST convention as getSupplyLines. This is a
+      -- separate case from the CANCELLED one above: checked live, part
+      -- 1000005-000 still had two live (non-cancelled) qty-148 lines under
+      -- POKRM01_TEST00000006, both real Manufacturo test data.
+      AND (po.order_header_site_code IS NULL OR RIGHT(po.order_header_site_code, 5) <> '_TEST')
     GROUP BY s.Type, s.SourceId, s.ProductId
     ORDER BY totalQuantity DESC
   `);

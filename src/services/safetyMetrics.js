@@ -123,13 +123,14 @@ async function getFurtherActionAging(pool) {
 
 async function getOldestOpenActions(pool) {
   const result = await pool.request().query(`
-    SELECT TOP ${OLDEST_OPEN_ACTIONS_LIMIT} issue_key, assignee, age_days
+    SELECT TOP ${OLDEST_OPEN_ACTIONS_LIMIT} issue_key, description, assignee, age_days
     FROM dbo.further_actions
     WHERE status_category <> 'Done'
     ORDER BY age_days DESC
   `);
   return result.recordset.map((r) => ({
     issueKey: r.issue_key,
+    description: r.description,
     assignee: r.assignee,
     ageDays: r.age_days,
   }));
